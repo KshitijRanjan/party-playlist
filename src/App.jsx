@@ -55,7 +55,7 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 
 // YouTube API Key
-const YOUTUBE_API_KEY = 'AIzaSyD5XX5_5fICuubh1QGWQI7t3p7oFG74fr8';
+const YOUTUBE_API_KEY = import.meta.env.VITE_YOUTUBE_API_KEY;
 
 // Hardcoded PINs
 const HOST_PIN = '2508';
