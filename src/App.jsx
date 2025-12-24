@@ -545,6 +545,7 @@ function HostView() {
 
       do {
         // Fetch playlist items from YouTube API with pagination
+        // This returns items in the user-defined order
         const playlistUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${extractedId}&maxResults=50&pageToken=${nextPageToken}&key=${YOUTUBE_API_KEY}`;
         const playlistRes = await fetch(playlistUrl);
         const playlistData = await playlistRes.json();
@@ -562,31 +563,47 @@ function HostView() {
           break;
         }
 
-        // Get video IDs for duration filtering
+        // Get video IDs to fetch duration
         const videoIds = playlistData.items
           .map((item) => item.snippet.resourceId?.videoId)
           .filter(Boolean)
           .join(',');
 
         // Fetch video details for duration
-        const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${videoIds}&key=${YOUTUBE_API_KEY}`;
+        // Note: The order of items in this response is NOT guaranteed to match the request
+        const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${videoIds}&key=${YOUTUBE_API_KEY}`;
         const detailsRes = await fetch(detailsUrl);
         const detailsData = await detailsRes.json();
 
-        // Filter videos under 8 minutes and prepare for batch add
-        const validVideos = detailsData.items
-          .filter((video) => {
-            const duration = parseDuration(video.contentDetails.duration);
-            return duration <= 480; // 8 minutes
-          })
-          .map((video) => ({
-            videoId: video.id,
-            title: video.snippet.title,
-            channelTitle: video.snippet.channelTitle,
-            thumbnailUrl: video.snippet.thumbnails.medium?.url || video.snippet.thumbnails.default?.url,
-          }));
+        // Create a map of videoId -> duration
+        const durationMap = new Map();
+        detailsData.items.forEach(item => {
+          durationMap.set(item.id, parseDuration(item.contentDetails.duration));
+        });
 
-        // Add to Firestore and count
+        // Filter and map using the ORIGINAL playlistData.items to preserve order
+        const validVideos = playlistData.items
+          .map((item) => {
+            const videoId = item.snippet.resourceId?.videoId;
+            const duration = durationMap.get(videoId);
+
+            // If duration is missing (e.g. deleted video) or > 8 mins, skip
+            // Also sometimes duration might be 0 for live streams, we might want to skip those too
+            if (duration === undefined || duration > 480) return null;
+
+            return {
+              videoId: videoId,
+              title: item.snippet.title,
+              thumbnailUrl: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url,
+              channelTitle: item.snippet.channelTitle
+            };
+          })
+          .filter(Boolean); // Remove nulls
+
+        // Add to Firestore sequentially to preserve order in addedAt timestamps
+        // We use a small delay or rely on the natural async delay to ensure distinct timestamps if needed,
+        // but sequential await is usually enough for serverTimestamp order if Firestore allows.
+        // To be safe, we can just await.
         for (const video of validVideos) {
           await addDoc(collection(db, 'queue'), {
             videoId: video.videoId,
@@ -695,17 +712,23 @@ function HostView() {
         if (!currentSong || currentSong.id !== playing.id) {
           setCurrentSong(playing);
           if (playerRef.current && playerRef.current.loadVideoById) {
-            playerRef.current.loadVideoById(playing.videoId);
+            playerRef.current.loadVideoById({
+              videoId: playing.videoId,
+              startSeconds: 0,
+              suggestedQuality: 'default'
+            });
+            playerRef.current.playVideo();
           }
         }
-      } else if (songs.length > 0) {
+      } else {
         // No song playing, start the first pending one
         const nextSong = songs.find((s) => s.status === 'pending');
         if (nextSong) {
+          setCurrentSong(nextSong); // Set state immediately to prevent multiple triggers
           await updateDoc(doc(db, 'queue', nextSong.id), { status: 'playing' });
+        } else {
+          setCurrentSong(null);
         }
-      } else {
-        setCurrentSong(null);
       }
     });
 
@@ -1068,7 +1091,7 @@ function HostView() {
           {upNext.length === 0 ? (
             <p className="text-slate-500 text-sm italic">Queue is empty...</p>
           ) : (
-            upNext.slice(0, 50).map((song, index) => (
+            upNext.map((song, index) => (
               <div key={song.id} className="flex items-center gap-3 bg-slate-800/60 rounded-xl p-2 group">
                 <span className="w-6 h-6 bg-slate-700 rounded-full flex items-center justify-center text-xs text-slate-400 font-bold flex-shrink-0">
                   {index + 1}
