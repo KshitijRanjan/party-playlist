@@ -724,7 +724,6 @@ function HostView() {
         // No song playing, start the first pending one
         const nextSong = songs.find((s) => s.status === 'pending');
         if (nextSong) {
-          setCurrentSong(nextSong); // Set state immediately to prevent multiple triggers
           await updateDoc(doc(db, 'queue', nextSong.id), { status: 'playing' });
         } else {
           setCurrentSong(null);
