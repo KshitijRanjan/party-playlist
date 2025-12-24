@@ -496,6 +496,13 @@ function HostView() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [showSidebar, setShowSidebar] = useState(false);
 
+  const transitionTriggeredRef = useRef(false);
+
+  // Reset transition flag when song changes
+  useEffect(() => {
+    transitionTriggeredRef.current = false;
+  }, [currentSong]);
+
   // Clear Playlist with PIN
   const handleClearPlaylist = async () => {
     const pin = window.prompt('Enter PIN to clear playlist:');
@@ -748,15 +755,22 @@ function HostView() {
           if (total > 0) {
             setProgress(current);
             setDuration(total);
+
+            // Proactive transition: If less than 2 seconds remain, trigger next song
+            if (total - current < 2 && !transitionTriggeredRef.current && isPlaying) {
+              console.log('Proactive transition triggered');
+              transitionTriggeredRef.current = true;
+              handleSongEnded();
+            }
           }
         } catch (e) {
           // Player not ready
         }
       }
-    }, 1000);
+    }, 250);
 
     return () => clearInterval(interval);
-  }, [playerReady]);
+  }, [playerReady, isPlaying]);
 
   // Handle Seek
   const handleSeek = (e) => {
