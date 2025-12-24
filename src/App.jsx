@@ -592,7 +592,7 @@ function HostView() {
             videoId: video.videoId,
             title: video.title,
             thumbnailUrl: video.thumbnailUrl,
-            channelTitle: video.snippet.channelTitle,
+            channelTitle: video.channelTitle,
             addedBy: 'host-seed',
             addedAt: serverTimestamp(),
             status: 'pending',
