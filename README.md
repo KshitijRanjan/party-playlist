@@ -14,7 +14,7 @@ A collaborative, real-time music queue application designed for weddings and par
 - **Duration Limit:** Only allows adding songs under 8 minutes to keep the vibe moving.
 
 ### 🎧 Host & Admin
-- **Secure Control:** Host access protected by a separate PIN (`2508`).
+- **Secure Control:** Host access protected by a separate PIN .
 - **Music Player:** Hidden YouTube player with custom controls (Play/Pause, Previous, Skip).
 - **Queue Management:**
     - **Prioritize:** "Play Next" feature to bump requested songs to the top.

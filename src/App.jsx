@@ -539,67 +539,75 @@ function HostView() {
         extractedId = urlMatch[1];
       }
 
-      // Fetch playlist items from YouTube API
-      const playlistUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${extractedId}&maxResults=20&key=${YOUTUBE_API_KEY}`;
-      const playlistRes = await fetch(playlistUrl);
-      const playlistData = await playlistRes.json();
-
-      if (playlistData.error) {
-        throw new Error(playlistData.error.message || 'Failed to fetch playlist');
-      }
-
-      if (!playlistData.items || playlistData.items.length === 0) {
-        setToast({ message: 'Playlist is empty or not found.', type: 'error' });
-        setSeedingPlaylist(false);
-        return;
-      }
-
-      // Get video IDs for duration filtering
-      const videoIds = playlistData.items
-        .map((item) => item.snippet.resourceId?.videoId)
-        .filter(Boolean)
-        .join(',');
-
-      // Fetch video details for duration
-      const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${videoIds}&key=${YOUTUBE_API_KEY}`;
-      const detailsRes = await fetch(detailsUrl);
-      const detailsData = await detailsRes.json();
-
-      // Filter videos under 8 minutes and prepare for batch add
-      const validVideos = detailsData.items
-        .filter((video) => {
-          const duration = parseDuration(video.contentDetails.duration);
-          return duration <= 480; // 8 minutes
-        })
-        .map((video) => ({
-          videoId: video.id,
-          title: video.snippet.title,
-          channelTitle: video.snippet.channelTitle,
-          thumbnailUrl: video.snippet.thumbnails.medium?.url || video.snippet.thumbnails.default?.url,
-        }));
-
-      if (validVideos.length === 0) {
-        setToast({ message: 'No valid videos found (all over 8 min).', type: 'error' });
-        setSeedingPlaylist(false);
-        return;
-      }
-
-      // Batch add to Firestore
+      let allValidVideos = [];
+      let nextPageToken = '';
       let addedCount = 0;
-      for (const video of validVideos) {
-        await addDoc(collection(db, 'queue'), {
-          videoId: video.videoId,
-          title: video.title,
-          thumbnailUrl: video.thumbnailUrl,
-          channelTitle: video.channelTitle,
-          addedBy: 'host-seed',
-          addedAt: serverTimestamp(),
-          status: 'pending',
-        });
-        addedCount++;
-      }
 
-      setToast({ message: `Added ${addedCount} songs from playlist!`, type: 'success' });
+      do {
+        // Fetch playlist items from YouTube API with pagination
+        const playlistUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${extractedId}&maxResults=50&pageToken=${nextPageToken}&key=${YOUTUBE_API_KEY}`;
+        const playlistRes = await fetch(playlistUrl);
+        const playlistData = await playlistRes.json();
+
+        if (playlistData.error) {
+          throw new Error(playlistData.error.message || 'Failed to fetch playlist');
+        }
+
+        if (!playlistData.items || playlistData.items.length === 0) {
+          if (allValidVideos.length === 0) {
+            setToast({ message: 'Playlist is empty or not found.', type: 'error' });
+            setSeedingPlaylist(false);
+            return;
+          }
+          break;
+        }
+
+        // Get video IDs for duration filtering
+        const videoIds = playlistData.items
+          .map((item) => item.snippet.resourceId?.videoId)
+          .filter(Boolean)
+          .join(',');
+
+        // Fetch video details for duration
+        const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=${videoIds}&key=${YOUTUBE_API_KEY}`;
+        const detailsRes = await fetch(detailsUrl);
+        const detailsData = await detailsRes.json();
+
+        // Filter videos under 8 minutes and prepare for batch add
+        const validVideos = detailsData.items
+          .filter((video) => {
+            const duration = parseDuration(video.contentDetails.duration);
+            return duration <= 480; // 8 minutes
+          })
+          .map((video) => ({
+            videoId: video.id,
+            title: video.snippet.title,
+            channelTitle: video.snippet.channelTitle,
+            thumbnailUrl: video.snippet.thumbnails.medium?.url || video.snippet.thumbnails.default?.url,
+          }));
+
+        // Add to Firestore and count
+        for (const video of validVideos) {
+          await addDoc(collection(db, 'queue'), {
+            videoId: video.videoId,
+            title: video.title,
+            thumbnailUrl: video.thumbnailUrl,
+            channelTitle: video.snippet.channelTitle,
+            addedBy: 'host-seed',
+            addedAt: serverTimestamp(),
+            status: 'pending',
+          });
+          addedCount++;
+        }
+
+        nextPageToken = playlistData.nextPageToken;
+      } while (nextPageToken);
+
+      if (addedCount === 0) {
+        setToast({ message: 'No valid videos found (all over 8 min).', type: 'error' });
+      } else {
+        setToast({ message: `Added ${addedCount} songs from playlist!`, type: 'success' });
+      }
       setPlaylistId('');
     } catch (err) {
       console.error('Seed playlist error:', err);
