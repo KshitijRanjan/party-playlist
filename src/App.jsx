@@ -15,7 +15,8 @@ import {
   serverTimestamp,
   deleteDoc,
   getDocs,
-  Timestamp, // Ensure Timestamp is available if needed, though we might use serverTimestamp or JS date math
+  writeBatch,
+  Timestamp,
 } from 'firebase/firestore';
 import {
   Search,
@@ -601,9 +602,6 @@ function HostView() {
           .filter(Boolean); // Remove nulls
 
         // Add to Firestore sequentially to preserve order in addedAt timestamps
-        // We use a small delay or rely on the natural async delay to ensure distinct timestamps if needed,
-        // but sequential await is usually enough for serverTimestamp order if Firestore allows.
-        // To be safe, we can just await.
         for (const video of validVideos) {
           await addDoc(collection(db, 'queue'), {
             videoId: video.videoId,
@@ -680,7 +678,7 @@ function HostView() {
     }
     // YT.PlayerState.PLAYING = 1
     setIsPlaying(event.data === 1);
-  }, []);
+  }, [queue, currentSong]); // Added dependencies for clarity, though useCallback usually empty here if using refs or internal logic
 
   // Listen to queue
   useEffect(() => {
@@ -722,8 +720,12 @@ function HostView() {
         }
       } else {
         // No song playing, start the first pending one
+        // Note: We rely on handleSongEnded to trigger this transition usually.
+        // But if the app loads fresh and nothing is playing but there are pending songs, we kickstart it.
         const nextSong = songs.find((s) => s.status === 'pending');
         if (nextSong) {
+          // Check if we just finished a song to avoid double-trigger? 
+          // If 'playing' is undefined, and we have pending, we should play.
           await updateDoc(doc(db, 'queue', nextSong.id), { status: 'playing' });
         } else {
           setCurrentSong(null);
@@ -756,14 +758,40 @@ function HostView() {
     return () => clearInterval(interval);
   }, [playerReady]);
 
+  // Handle Seek
+  const handleSeek = (e) => {
+    const time = parseFloat(e.target.value);
+    setProgress(time); // Immediate visual feedback
+    if (playerRef.current && playerRef.current.seekTo) {
+      playerRef.current.seekTo(time, true);
+    }
+  };
+
   // Handle song ended
   const handleSongEnded = async () => {
     if (currentSong) {
-      // Mark as played instead of deleting
-      await updateDoc(doc(db, 'queue', currentSong.id), { status: 'played' });
-      setCurrentSong(null);
-      setProgress(0);
-      setDuration(0);
+      // Atomic update: Mark current as played AND next as playing
+      const batch = writeBatch(db);
+      const currentRef = doc(db, 'queue', currentSong.id);
+      batch.update(currentRef, { status: 'played' });
+
+      // Find next song (first pending)
+      const nextSong = queue.filter(s => s.status === 'pending')[0];
+
+      if (nextSong) {
+        const nextRef = doc(db, 'queue', nextSong.id);
+        batch.update(nextRef, { status: 'playing' });
+      } else {
+        setCurrentSong(null);
+      }
+
+      await batch.commit();
+
+      // Reset local player state if no next song
+      if (!nextSong) {
+        setProgress(0);
+        setDuration(0);
+      }
     }
   };
 
@@ -773,8 +801,22 @@ function HostView() {
       if (playerRef.current && playerRef.current.stopVideo) {
         playerRef.current.stopVideo();
       }
-      await updateDoc(doc(db, 'queue', currentSong.id), { status: 'played' });
-      setCurrentSong(null);
+
+      const batch = writeBatch(db);
+      const currentRef = doc(db, 'queue', currentSong.id);
+      batch.update(currentRef, { status: 'played' });
+
+      const nextSong = queue.filter(s => s.status === 'pending')[0];
+
+      if (nextSong) {
+        const nextRef = doc(db, 'queue', nextSong.id);
+        batch.update(nextRef, { status: 'playing' });
+      } else {
+        setCurrentSong(null);
+      }
+
+      await batch.commit();
+
       setProgress(0);
       setDuration(0);
     }
@@ -785,24 +827,9 @@ function HostView() {
     const playedSongs = queue.filter(s => s.status === 'played');
     if (playedSongs.length === 0) return;
 
-    const lastPlayed = playedSongs[playedSongs.length - 1]; // Last one added to played list
+    const lastPlayed = playedSongs[playedSongs.length - 1];
 
-    // Set current playing to pending (push back to queue top)
     if (currentSong) {
-      await updateDoc(doc(db, 'queue', currentSong.id), { status: 'pending', addedAt: serverTimestamp() }); // re-add with new timestamp to go to bottom? Or keep same? logic says Top. 
-      // If we want it at the top, we need a smaller timestamp?
-      // Actually, "Previous" usually just puts the last played song into 'playing' state and the current one back to 'pending' (first in line).
-      // But our sort is by addedAt. If we want to re-insert at top, we need to handle sort.
-      // Easiest: Set current to 'pending', set lastPlayed to 'playing'.
-      // Since they are sorted by time, they will respect their original order?
-      // A played song is older than a pending song. So 'lastPlayed' will be before 'currentSong'.
-      // If we set 'lastPlayed' to 'playing', checking logic picks it up.
-      // Current song becomes 'pending'.
-
-      // Issue: auto-play logic picks the *first* pending song. 
-      // If we have 'lastPlayed' (old) and 'current' (newer), and both are pending (if we just swap states),
-      // then 'lastPlayed' is older, so it will be picked up first. Correct.
-
       await updateDoc(doc(db, 'queue', currentSong.id), { status: 'pending' });
     }
 
@@ -824,39 +851,20 @@ function HostView() {
   // Play next (prioritize)
   const handlePlayNext = async (song) => {
     try {
-      // Find the current earliest pending song timestamp
       const pendingSongs = queue.filter(s => s.status === 'pending');
       if (pendingSongs.length === 0) return;
 
-      const topSong = pendingSongs[0]; // Already sorted by addedAt asc
+      const topSong = pendingSongs[0];
 
-      // If already playing next, do nothing
       if (topSong.id === song.id) {
         setToast({ message: 'Song is already up next!', type: 'success' });
         return;
       }
 
-      // Create a timestamp slightly earlier than the top song
-      // We need to handle Firestore Timestamp objects or JS dates
-      // queue items have addedAt as a Timestamp probably
-
       let newTime;
       if (topSong.addedAt && typeof topSong.addedAt.toMillis === 'function') {
-        newTime = Timestamp.fromMillis(topSong.addedAt.toMillis() - 1000); // 1 second earlier
+        newTime = Timestamp.fromMillis(topSong.addedAt.toMillis() - 1000);
       } else {
-        // Fallback if it's not a proper timestamp (shouldn't happen with serverTimestamp)
-        newTime = serverTimestamp(); // This puts it at END. We want BEGINNING.
-        // If we can't do relative math easily on serverTimestamp(), we might skip or assume client time?
-        // But serverTimestamp is opaque on client until saved.
-        // existing items have real timestamps.
-        // Let's assume queue items are loaded with resolved timestamps.
-        // If a song was JUST added, it might wait for server response.
-        // But `queue` comes from onSnapshot.
-
-        // If we don't have a valid reference, we can try to set it to a very old date? 
-        // But that might mess up history order if we use same field.
-        // Better to subtract 1000ms from topSong.
-        // If topSong.addedAt is missing, use current time - 1 hour?
         const baseTime = topSong.addedAt?.toMillis ? topSong.addedAt.toMillis() : Date.now();
         newTime = Timestamp.fromMillis(baseTime - 1000);
       }
@@ -866,7 +874,7 @@ function HostView() {
       });
 
       setToast({ message: 'Song moved to top of queue!', type: 'success' });
-      setShowSidebar(false); // Close sidebar to show result
+      setShowSidebar(false);
     } catch (err) {
       console.error('Play next error:', err);
       setToast({ message: 'Failed to prioritize song', type: 'error' });
@@ -982,14 +990,19 @@ function HostView() {
               </div>
             </div>
 
-            {/* Progress Bar */}
-            <div className="mb-6">
-              <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-gradient-to-r from-purple-500 to-pink-500 transition-all duration-1000"
-                  style={{ width: `${progressPercent}%` }}
-                />
-              </div>
+            {/* Progress Bar / Seeker */}
+            <div className="mb-6 group">
+              <input
+                type="range"
+                min="0"
+                max={duration || 100}
+                value={progress}
+                onChange={handleSeek}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:transition-all [&::-webkit-slider-thumb]:hover:scale-125"
+                style={{
+                  background: `linear-gradient(to right, #a855f7 0%, #ec4899 ${progressPercent}%, #334155 ${progressPercent}%, #334155 100%)`
+                }}
+              />
               <div className="flex justify-between text-sm text-slate-400 mt-2">
                 <span>{formatTime(progress)}</span>
                 <span>{formatTime(duration)}</span>
